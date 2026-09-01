@@ -109,6 +109,57 @@ bun run dev
 2. `Select restore target:` → `open-po — ...`
 3. `Restore to ...?` → `Restoring...` (for `directory`/`custom` uses `-j 20` hyper-threading) → `Restore completed`
 
+## Build
+
+Compile to a single executable — no Bun needed on the target machine. `config.json` and `backups/` stay next to the binary (or set absolute `outputDir`).
+
+### All platforms (1 command)
+
+```bash
+bun run build:all
+# → dist/database-tools.exe (Windows)
+# → dist/database-tools-linux (Linux x64)
+# → dist/database-tools-macos-arm64 (Apple Silicon)
+# → dist/database-tools-macos-x64 (Intel)
+# or single current OS: bun run build
+```
+
+### Windows
+
+```powershell
+cd D:\database-tools
+bun install
+bun build src/index.ts --compile --outfile database-tools.exe
+.\database-tools.exe
+# cross-compile explicitly
+bun build src/index.ts --compile --target bun-windows-x64 --outfile database-tools.exe
+```
+
+### Linux
+
+```bash
+cd ~/Projects/BunProjects/database-tools
+bun install
+bun build src/index.ts --compile --target bun-linux-x64 --outfile database-tools-linux
+chmod +x database-tools-linux
+./database-tools-linux
+```
+
+### macOS
+
+```bash
+cd ~/Projects/BunProjects/database-tools
+bun install
+# Apple Silicon (M1/M2/M3)
+bun build src/index.ts --compile --target bun-darwin-arm64 --outfile database-tools-macos
+# Intel
+bun build src/index.ts --compile --target bun-darwin-x64 --outfile database-tools-macos
+chmod +x database-tools-macos
+./database-tools-macos
+```
+
+> Binary still needs `pg_dump`/`psql` in `PATH` or `pgBin`/`bin/pgsql` (auto-download). Add `--minify` for smaller size. Cross-compile from any OS with `--target`.
+
 ## Output Structure
 
 ```

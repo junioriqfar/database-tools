@@ -109,6 +109,57 @@ bun run dev
 2. `Select restore target:` → `open-po — ...`
 3. `Restore to ...?` → `Restoring...` (untuk `directory`/`custom` pakai `-j 20` hyper-threading) → `Restore completed`
 
+## Build
+
+Compile jadi satu binary — target tidak perlu install Bun. `config.json` dan `backups/` tetap di sebelah binary (atau pakai `outputDir` absolute).
+
+### Semua platform (1 perintah)
+
+```bash
+bun run build:all
+# → dist/database-tools.exe (Windows)
+# → dist/database-tools-linux (Linux x64)
+# → dist/database-tools-macos-arm64 (Apple Silicon)
+# → dist/database-tools-macos-x64 (Intel)
+# atau OS sekarang saja: bun run build
+```
+
+### Windows
+
+```powershell
+cd D:\database-tools
+bun install
+bun build src/index.ts --compile --outfile database-tools.exe
+.\database-tools.exe
+# cross-compile eksplisit
+bun build src/index.ts --compile --target bun-windows-x64 --outfile database-tools.exe
+```
+
+### Linux
+
+```bash
+cd ~/Projects/BunProjects/database-tools
+bun install
+bun build src/index.ts --compile --target bun-linux-x64 --outfile database-tools-linux
+chmod +x database-tools-linux
+./database-tools-linux
+```
+
+### macOS
+
+```bash
+cd ~/Projects/BunProjects/database-tools
+bun install
+# Apple Silicon (M1/M2/M3)
+bun build src/index.ts --compile --target bun-darwin-arm64 --outfile database-tools-macos
+# Intel
+bun build src/index.ts --compile --target bun-darwin-x64 --outfile database-tools-macos
+chmod +x database-tools-macos
+./database-tools-macos
+```
+
+> Binary tetap butuh `pg_dump`/`psql` di `PATH` atau `pgBin`/`bin/pgsql` (auto-download). Tambah `--minify` untuk ukuran lebih kecil. Cross-compile dari OS mana saja pakai `--target`.
+
 ## Struktur Output
 
 ```
