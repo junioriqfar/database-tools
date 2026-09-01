@@ -124,6 +124,15 @@ bun run build:all
 # or single current OS: bun run build
 ```
 
+Zip before push tag:
+
+```bash
+bun run build:zip        # zip existing dist/* (38M/35M/25M/27M)
+# or build + zip in 1 command
+bun run build:all:zip
+gh release create v1.0.0 dist/*.zip --generate-notes
+```
+
 ### Windows
 
 ```powershell

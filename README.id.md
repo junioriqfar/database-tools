@@ -124,6 +124,15 @@ bun run build:all
 # atau OS sekarang saja: bun run build
 ```
 
+Zip sebelum push tag:
+
+```bash
+bun run build:zip        # zip dist/* yang sudah ada (38M/35M/25M/27M)
+# atau build + zip 1 perintah
+bun run build:all:zip
+gh release create v1.0.0 dist/*.zip --generate-notes
+```
+
 ### Windows
 
 ```powershell
