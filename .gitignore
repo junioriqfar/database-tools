@@ -1,0 +1,14 @@
+node_modules
+backups/*
+!backups/.gitkeep
+bin/pgsql/
+*.log
+*.tar
+*.sql
+*.dump
+.DS_Store
+
+# credentials — jangan push
+config.json
+.env
+.env.local

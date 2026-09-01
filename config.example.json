@@ -1,0 +1,25 @@
+{
+  "pgBin": "C:\\laragon\\bin\\postgresql\\postgresql-16.4-1\\bin",
+  "outputDir": "./backups",
+  "jobs": "auto",
+  "retentionDays": 7,
+  "databases": {
+    "open-po": {
+      "host": "localhost",
+      "port": 5432,
+      "database": "open-po",
+      "username": "postgres",
+      "password": "CHANGE_ME"
+    }
+  },
+  "restoreTargets": {
+    "open-po-local": {
+      "host": "localhost",
+      "port": 5432,
+      "database": "open-po",
+      "username": "postgres",
+      "password": "CHANGE_ME",
+      "createIfNotExists": true
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "database-tools",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.8.1",
+    "@inquirer/prompts": "^8.0.0",
+    "chalk": "^5.3.0",
+    "ora": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.0"
+  }
+}
