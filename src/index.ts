@@ -912,34 +912,77 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
   } catch {}
   const restoreStart = Date.now();
   let restoredCount = 0;
-  const restoreInitialBar = estimatedRestoreTotal ? ` ${renderBar(0, estimatedRestoreTotal)}` : "";
-  const restoreInitialCounter = estimatedRestoreTotal ? `0/${estimatedRestoreTotal} objects` : "0 objects";
-  const spin = ora(`Restoring... ${restoreInitialCounter}${restoreInitialBar}`).start();
+  let lastRestoreMsg = "starting...";
+
+  // Stacked bar like Backup (parity): top = objects, bottom = status line
+  const { default: cliProgress } = await import("cli-progress");
+  const padLeft = (s: string, w: number) => s.padStart(w);
+  const pctStr = (cur: number, total: number) => {
+    if (total <= 0) return "  0%".padStart(4);
+    const p = Math.round((Math.min(cur, total) / total) * 100);
+    return `${String(p).padStart(3)}%`;
+  };
+  const valueWidth = 20;
+  const pctWidth = 4;
+  const elapsedWidth = 8;
+  const multibar = new cliProgress.MultiBar({
+    clearOnComplete: false,
+    hideCursor: true,
+    barCompleteChar: "█",
+    barIncompleteChar: "░",
+    barsize: 22,
+    format: `{bar} {pctStr} | {valueStr} | {elapsedStr}`,
+    stopOnComplete: false,
+  }, cliProgress.Presets.shades_classic);
+
+  const restoreTotal = estimatedRestoreTotal || 1;
+  const restoreBar = multibar.create(restoreTotal, 0, {
+    pctStr: padLeft("0%", pctWidth),
+    valueStr: padLeft(`0/${estimatedRestoreTotal || "?"}`, valueWidth),
+    elapsedStr: padLeft("0s", elapsedWidth),
+  });
+  restoreBar.setTotal(restoreTotal);
+  const statusBar = multibar.create(1, 1, { status: chalk.dim("starting...") }, {
+    format: ` {status}`,
+    barCompleteChar: " ",
+    barIncompleteChar: " ",
+    barsize: 0,
+  });
+  restoreBar.update(0, {
+    pctStr: padLeft(pctStr(0, restoreTotal), pctWidth),
+    valueStr: padLeft(`0/${estimatedRestoreTotal || "?"}`, valueWidth),
+    elapsedStr: padLeft("0s", elapsedWidth),
+  });
+  statusBar.update(1, { status: chalk.dim("starting...") });
+
+  let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    const elapsed = formatDuration(Date.now() - restoreStart);
+    const cur = Math.min(restoredCount, restoreTotal);
+    restoreBar.update(cur, {
+      pctStr: padLeft(pctStr(cur, restoreTotal), pctWidth),
+      valueStr: padLeft(`${cur}/${estimatedRestoreTotal || "?"}`, valueWidth),
+      elapsedStr: padLeft(elapsed, elapsedWidth),
+    });
+    statusBar.update(1, { status: chalk.dim(lastRestoreMsg) });
+  }, 600);
 
   const onProgress = (msg: string) => {
-    const short = msg.slice(0, 70);
+    const short = msg.length > 65 ? msg.slice(0, 65) + "..." : msg;
+    lastRestoreMsg = short;
     const lower = msg.toLowerCase();
-    // pg_restore/psql verbose lines often contain "processing", "restoring", "creating", "table", "index"
-    if (lower.includes("processing") || lower.includes("restoring") || lower.includes("creating") || lower.includes("executing") || lower.includes("table") ) {
-      // Avoid counting duplicate for same msg? count each verbose line as 1 object
-      // For psql plain SQL, each "INSERT" or "CREATE" is an object
+    if (lower.includes("processing") || lower.includes("restoring") || lower.includes("creating") || lower.includes("executing") || lower.includes("table")) {
       if (lower.includes("table") || lower.includes("index") || lower.includes("sequence") || lower.includes("constraint") || lower.includes("data") || lower.includes("processing")) {
         restoredCount++;
       }
     }
-    // Also count generic pg_restore progress lines
-    if (lower.includes("pg_restore:") && !lower.includes("table")) {
-      // still count as progress tick if no table keyword
-      // throttle to avoid overcount: only if not already counted
-      if (!lower.includes("table") && !lower.includes("index") && restoredCount < estimatedRestoreTotal) {
-        // leave as is, don't double increment
-      }
-    }
     const elapsed = formatDuration(Date.now() - restoreStart);
-    // For restore, if we have estimate, show bar with capped count
-    const bar = estimatedRestoreTotal ? renderBar(Math.min(restoredCount, estimatedRestoreTotal), estimatedRestoreTotal) : "";
-    const counter = estimatedRestoreTotal ? `${Math.min(restoredCount, estimatedRestoreTotal)}/${estimatedRestoreTotal} objects` : `${restoredCount} objects`;
-    spin.text = `${bar} ${counter} • ${elapsed} • ${short}`;
+    const cur = Math.min(restoredCount, restoreTotal);
+    restoreBar.update(cur, {
+      pctStr: padLeft(pctStr(cur, restoreTotal), pctWidth),
+      valueStr: padLeft(`${cur}/${estimatedRestoreTotal || "?"}`, valueWidth),
+      elapsedStr: padLeft(elapsed, elapsedWidth),
+    });
+    statusBar.update(1, { status: chalk.dim(short) });
   };
 
   try {
@@ -950,12 +993,22 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
       jobs,
       onProgress,
     });
+    if (pollTimer) clearInterval(pollTimer);
     const totalElapsed = formatDuration(Date.now() - restoreStart);
-    const finalBar = estimatedRestoreTotal ? renderBar(Math.min(restoredCount, estimatedRestoreTotal), estimatedRestoreTotal) : "";
-    spin.succeed(`Restore completed ${finalBar} ${restoredCount}/${estimatedRestoreTotal || "?"} objects • ${totalElapsed}`);
+    const curFinal = estimatedRestoreTotal ? `${estimatedRestoreTotal}/${estimatedRestoreTotal}` : `${restoredCount}/${restoredCount || 1}`;
+    restoreBar.update(restoreTotal, {
+      pctStr: padLeft("100%", pctWidth),
+      valueStr: padLeft(curFinal, valueWidth),
+      elapsedStr: padLeft(totalElapsed, elapsedWidth),
+    });
+    statusBar.update(1, { status: chalk.dim("done") });
+    multibar.stop();
+    console.log(chalk.green(`✔ Restore completed ${curFinal} objects • ${totalElapsed}`));
     logSuccess(`Restored ${basename(dumpFile)} -> ${target.database}`);
   } catch (e: any) {
-    spin.fail("Restore failed");
+    if (pollTimer) clearInterval(pollTimer);
+    try { multibar.stop(); } catch {}
+    console.log(chalk.red(`✖ Restore failed: ${e.message}`));
     logError(e.message);
   }
 }
