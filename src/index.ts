@@ -5,7 +5,7 @@ import ora from "ora";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { loadConfig } from "./config.ts";
-import { backupDatabase, restoreDatabase, testConnection, getDatabaseSize, getTableCount, getSchemas, getTables, getEffectiveJobs, getTableSize, getTableDataSize, getTablesWithSizes } from "./db.ts";
+import { backupDatabase, restoreDatabase, testConnection, getDatabaseSize, getTableCount, getSchemas, getTables, getEffectiveJobs, getTableSize, getTableDataSize, getTablesWithSizes, getRestoreObjectCount } from "./db.ts";
 import type { BackupFormat } from "./db.ts";
 import { prettyBytes, getCpuInfo, getOptimalJobs, renderBar, formatDuration, parseSizeToBytes } from "./utils.ts";
 import { ensurePgBinaries, isPgDumpAvailable } from "./pgsql.ts";
@@ -908,20 +908,23 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
   logInfo(`Restore jobs: ${jobs} (logical:${cpu.logical}, HT:${cpu.hyperThreading ? "ON" : "OFF"})`);
   const isDirDump = (() => { try { return statSync(dumpFile).isDirectory(); } catch { return false; } })();
   let estimatedRestoreTotal = 0;
-  // Estimate total objects for progress: for directory dump count files, for sql estimate lines, else guess
+  // Estimate total objects for progress: use pg_restore --list TOC count for accuracy (parity backup's per-table estimate)
   try {
-    if (isDirDump) {
-      const tocFiles = readdirSync(dumpFile);
-      // directory dumps have many .dat.gz + toc.dat; use file count as proxy
-      estimatedRestoreTotal = tocFiles.length;
-    } else if (dumpFile.endsWith(".sql")) {
-      const st = statSync(dumpFile);
-      // rough: 1 object per ~50KB guess, or at least 1
-      estimatedRestoreTotal = Math.max(1, Math.round(st.size / (50 * 1024)));
-    } else {
-      // custom/tar: guess from file size
-      const st = statSync(dumpFile);
-      estimatedRestoreTotal = Math.max(1, Math.round(st.size / (100 * 1024)));
+    if (!dumpFile.endsWith(".sql")) {
+      const tocCnt = await getRestoreObjectCount(config.pgBin, dumpFile);
+      if (tocCnt > 0) estimatedRestoreTotal = tocCnt;
+    }
+    if (estimatedRestoreTotal === 0) {
+      if (isDirDump) {
+        const tocFiles = readdirSync(dumpFile);
+        estimatedRestoreTotal = tocFiles.length || 1;
+      } else if (dumpFile.endsWith(".sql")) {
+        const st = statSync(dumpFile);
+        estimatedRestoreTotal = Math.max(1, Math.round(st.size / (50 * 1024)));
+      } else {
+        const st = statSync(dumpFile);
+        estimatedRestoreTotal = Math.max(1, Math.round(st.size / (100 * 1024)));
+      }
     }
   } catch {}
   const restoreStart = Date.now();
@@ -971,10 +974,10 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
 
   let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
     const elapsed = formatDuration(Date.now() - restoreStart);
-    const cur = Math.min(restoredCount, restoreTotal);
-    restoreBar.update(cur, {
-      pctStr: padLeft(pctStr(cur, restoreTotal), pctWidth),
-      valueStr: padLeft(`${cur}/${estimatedRestoreTotal || "?"}`, valueWidth),
+    const displayCur = Math.min(restoredCount, Math.max(0, restoreTotal - 1));
+    restoreBar.update(displayCur, {
+      pctStr: padLeft(pctStr(displayCur, restoreTotal), pctWidth),
+      valueStr: padLeft(`${Math.min(restoredCount, restoreTotal)}/${estimatedRestoreTotal || "?"}`, valueWidth),
       elapsedStr: padLeft(elapsed, elapsedWidth),
     });
     statusBar.update(1, { status: chalk.dim(lastRestoreMsg) });
@@ -990,10 +993,10 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
       }
     }
     const elapsed = formatDuration(Date.now() - restoreStart);
-    const cur = Math.min(restoredCount, restoreTotal);
-    restoreBar.update(cur, {
-      pctStr: padLeft(pctStr(cur, restoreTotal), pctWidth),
-      valueStr: padLeft(`${cur}/${estimatedRestoreTotal || "?"}`, valueWidth),
+    const displayCur = Math.min(restoredCount, Math.max(0, restoreTotal - 1));
+    restoreBar.update(displayCur, {
+      pctStr: padLeft(pctStr(displayCur, restoreTotal), pctWidth),
+      valueStr: padLeft(`${Math.min(restoredCount, restoreTotal)}/${estimatedRestoreTotal || "?"}`, valueWidth),
       elapsedStr: padLeft(elapsed, elapsedWidth),
     });
     statusBar.update(1, { status: chalk.dim(short) });

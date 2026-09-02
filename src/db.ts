@@ -289,6 +289,24 @@ export async function getTablesWithSizes(pgBin: string, db: DatabaseConfig, sche
   });
 }
 
+export async function getRestoreObjectCount(pgBin: string, dumpFile: string): Promise<number> {
+  const pgRestore = getPgRestorePath(pgBin);
+  if (dumpFile.endsWith(".sql")) return 0;
+  return new Promise<number>((resolve) => {
+    const child = spawn(pgRestore, ["-l", dumpFile], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("close", (code) => {
+      if (code !== 0) resolve(0);
+      else {
+        const cnt = out.split("\n").filter((l) => l.trim() && !l.trim().startsWith(";")).length;
+        resolve(cnt);
+      }
+    });
+    child.on("error", () => resolve(0));
+  });
+}
+
 export async function getTables(pgBin: string, db: DatabaseConfig, schema: string): Promise<string[]> {
   const psql = getPsqlPath(pgBin);
   const env = { PGPASSWORD: db.password };
