@@ -9,7 +9,11 @@
       "port": 5432,
       "database": "open-po",
       "username": "postgres",
-      "password": "CHANGE_ME"
+      "password": "YOUR_SECRET_PASSWORD",
+      "schemas": ["public"],
+      "includeTables": ["public.users", "public.orders", "public.products"],
+      "excludeTables": [],
+      "excludeTableData": []
     }
   },
   "restoreTargets": {
@@ -18,7 +22,7 @@
       "port": 5432,
       "database": "open-po",
       "username": "postgres",
-      "password": "CHANGE_ME",
+      "password": "YOUR_SECRET_PASSWORD",
       "createIfNotExists": true
     }
   }

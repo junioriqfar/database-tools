@@ -10,6 +10,9 @@ export interface DatabaseConfig {
   username: string;
   password: string;
   schemas?: string[]; // optional — if omitted, auto-discovered from DB
+  includeTables?: string[]; // whitelist: only these tables (--table), e.g. ["public.users","public.orders"]
+  excludeTables?: string[]; // blacklist: skip entirely (--exclude-table), e.g. ["public.audit_log"]
+  excludeTableData?: string[]; // skip data only (--exclude-table-data), e.g. ["public.history_api"]
 }
 
 export interface RestoreTarget extends DatabaseConfig {
@@ -45,6 +48,23 @@ export function loadConfig(): AppConfig {
     throw new Error("No databases defined in config.json");
   }
 
+  // Security: warn if config.json is not ignored by .gitignore (risk of committing credentials)
+  try {
+    if (existsSync(resolve(baseDir, ".git"))) {
+      const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+      const res = spawnSync("git", ["check-ignore", "-q", configPath], { stdio: "ignore" });
+      if (res.status === 1) {
+        console.warn(`[warn] config.json is NOT ignored by .gitignore — add "config.json" to .gitignore to avoid committing credentials!`);
+      }
+      // Also warn about weak default passwords
+      for (const [k, db] of Object.entries(cfg.databases)) {
+        if (db.password === "CHANGE_ME" || db.password === "password" || db.password.length < 4) {
+          console.warn(`[warn] database "${k}" has weak/default password`);
+        }
+      }
+    }
+  } catch {}
+
   // Resolve outputDir relative to project root
   cfg.outputDir = resolveOutputDir(cfg.outputDir || "./backups", baseDir);
 
@@ -55,6 +75,20 @@ export function loadConfig(): AppConfig {
 
   // Defaults
   if (!cfg.jobs) cfg.jobs = 4;
+
+  // Normalize per-database table filters: trim, filter empty, ensure arrays
+  for (const [k, db] of Object.entries(cfg.databases)) {
+    if (db.includeTables && !Array.isArray(db.includeTables)) db.includeTables = [String(db.includeTables)] as any;
+    if (db.excludeTables && !Array.isArray(db.excludeTables)) db.excludeTables = [String(db.excludeTables)] as any;
+    if (db.excludeTableData && !Array.isArray(db.excludeTableData)) db.excludeTableData = [String(db.excludeTableData)] as any;
+    db.includeTables = (db.includeTables || []).map((s: string) => String(s).trim()).filter(Boolean);
+    db.excludeTables = (db.excludeTables || []).map((s: string) => String(s).trim()).filter(Boolean);
+    db.excludeTableData = (db.excludeTableData || []).map((s: string) => String(s).trim()).filter(Boolean);
+    // Validate mutual exclusivity: includeTables whitelist vs exclude
+    if (db.includeTables!.length > 0 && (db.excludeTables!.length > 0 || db.excludeTableData!.length > 0)) {
+      console.warn(`[warn] database "${k}" has both includeTables and exclude* set — includeTables (--table) will take precedence and exclude* will be ignored`);
+    }
+  }
 
   return cfg;
 }

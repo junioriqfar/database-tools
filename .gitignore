@@ -2,11 +2,15 @@ dist/
 node_modules
 backups/*
 !backups/.gitkeep
+bin/
 bin/pgsql/
 *.log
 *.tar
 *.sql
 *.dump
+*.rar
+*.zip
+*.gz
 .DS_Store
 
 # credentials — jangan push

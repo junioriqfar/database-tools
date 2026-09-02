@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { spawn } from "node:child_process";
-import { homedir, platform, arch } from "node:os";
+import { existsSync, mkdirSync, cpSync } from "node:fs";
+import { join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { arch } from "node:os";
 
 // Cross-platform pg_dump auto-download
 // If pg_dump not found in pgBin nor in PATH, download from EDB
@@ -193,8 +193,6 @@ async function extractArchive(archivePath: string, destDir: string, onProgress?:
   onProgress?.(`Extracting ${archivePath}...`);
 
   if (pl === "win32") {
-    // Use PowerShell Expand-Archive
-    // Archive is .zip, contains pgsql/...
     const psCmd = [
       "powershell",
       "-NoProfile",
@@ -218,65 +216,46 @@ async function extractArchive(archivePath: string, destDir: string, onProgress?:
       });
       child.on("error", reject);
     });
-  } else {
-    // Linux/macOS: .tar.gz, use tar -xzf
-    const tarCmd = ["tar", "-xzf", archivePath, "-C", destDir, "--strip-components=1"];
-    // Actually EDB tar contains pgsql/... so we need to strip? Let's just extract and check
-    // Simpler: tar -xzf archive -C destDir
-    // If archive contains pgsql/ at top, then bin will be at destDir/pgsql/bin
-    // Our localBin is destDir/bin, but with pgsql prefix, need to handle
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(tarCmd[0]!, tarCmd.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
-      let err = "";
-      child.stderr?.on("data", (d) => (err += d.toString()));
-      child.on("close", (code) => {
-        if (code === 0) {
-          // EDB tar extracts to pgsql/ in destDir, so we need to move pgsql/* to destDir if needed
-          // Check if destDir/pgsql exists and destDir/bin doesn't
-          const pgsqlDir = join(destDir, "pgsql");
-          const binInPgsql = join(pgsqlDir, "bin");
-          const binDirect = join(destDir, "bin");
-          try {
-            if (existsSync(binInPgsql) && !existsSync(binDirect)) {
-              // Move pgsql contents to destDir? Actually we want bin/pgsql/bin, but EDB has pgsql/bin
-              // Our localBin is destDir/bin, but if we extracted with strip, it may be destDir/bin already
-              // Check
-              const { renameSync, cpSync } = require("node:fs");
-              // If destDir/pgsql exists, we can use it directly as pgBin
-              // For simplicity, keep as destDir/pgsql/bin and return that
-              onProgress?.(`Extracted to ${pgsqlDir}`);
-            } else {
-              onProgress?.(`Extracted to ${destDir}`);
-            }
-            resolve();
-          } catch (e: any) {
-            reject(e);
-          }
-        } else {
-          reject(new Error(`tar extract failed: ${err}`));
-        }
-      });
-      child.on("error", reject);
-    });
+    return;
+  }
 
-    // Handle pgsql prefix: if extracted to destDir/pgsql/bin, we need to ensure localBin points correctly
-    // Our getLocalPgBinDir is destDir/bin, but EDB extracts to destDir/pgsql/bin
-    // So check and adjust
-    const pgsqlBin = join(destDir, "pgsql", "bin");
-    const expectedBin = join(destDir, "bin");
-    if (existsSync(pgsqlBin) && !existsSync(expectedBin)) {
-      // Create bin and move? Actually we can just return pgsql/bin as pgBin
-      // For simplicity, we will keep pgBin as pgsql/bin and handle in caller
-      // But our function returns localBin which is destDir/bin, so we need to handle
-      // Let's move or symlink
+  // Linux/macOS: EDB archive contains pgsql/ at top level
+  // Keep archive structure first, then normalize to destDir/bin
+  const tarCmd = ["tar", "-xzf", archivePath, "-C", destDir];
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(tarCmd[0]!, tarCmd.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+    let err = "";
+    child.stderr?.on("data", (d) => (err += d.toString()));
+    child.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`tar extract failed: ${err || `exit ${code}`}`));
+    });
+    child.on("error", reject);
+  });
+
+  // Normalize: EDB extracts to destDir/pgsql/bin but getLocalPgBinDir expects destDir/bin
+  const pgsqlBin = join(destDir, "pgsql", "bin");
+  const expectedBin = join(destDir, "bin");
+  if (existsSync(pgsqlBin) && !existsSync(expectedBin)) {
+    try {
+      mkdirSync(expectedBin, { recursive: true });
+      // Try native cpSync (Node 16+) for cross-platform copy
       try {
-        const { cpSync, rmSync } = await import("node:fs");
-        // Copy pgsql/bin to bin
-        mkdirSync(expectedBin, { recursive: true });
-        const files = Bun.spawnSync(["cp", "-r", `${pgsqlBin}/.`, expectedBin]);
-        // If cp fails, try manual
-      } catch {}
+        cpSync(pgsqlBin, expectedBin, { recursive: true, force: true });
+        onProgress?.(`Normalized ${pgsqlBin} -> ${expectedBin}`);
+      } catch {
+        // Fallback to spawn cp -r (Unix)
+        const cp = spawnSync("cp", ["-r", `${pgsqlBin}/.`, expectedBin]);
+        if (cp.status !== 0) throw new Error(cp.stderr?.toString() || "cp failed");
+        onProgress?.(`Normalized via cp -r to ${expectedBin}`);
+      }
+    } catch (e: any) {
+      onProgress?.(`Normalize failed: ${e.message} — will use ${pgsqlBin} directly`);
     }
+  } else if (existsSync(expectedBin)) {
+    onProgress?.(`Extracted to ${destDir}`);
+  } else if (existsSync(pgsqlBin)) {
+    onProgress?.(`Extracted to ${join(destDir, "pgsql")}`);
   }
 }
 

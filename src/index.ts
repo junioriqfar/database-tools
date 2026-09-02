@@ -5,9 +5,9 @@ import ora from "ora";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { loadConfig } from "./config.ts";
-import { backupDatabase, restoreDatabase, testConnection, getDatabaseSize, getTableCount, getSchemas, getTables, getEffectiveJobs } from "./db.ts";
+import { backupDatabase, restoreDatabase, testConnection, getDatabaseSize, getTableCount, getSchemas, getTables, getEffectiveJobs, getTableSize, getTableDataSize, getTablesWithSizes } from "./db.ts";
 import type { BackupFormat } from "./db.ts";
-import { prettyBytes, getCpuInfo, getOptimalJobs } from "./utils.ts";
+import { prettyBytes, getCpuInfo, getOptimalJobs, renderBar, formatDuration, parseSizeToBytes } from "./utils.ts";
 import { ensurePgBinaries, isPgDumpAvailable } from "./pgsql.ts";
 
 function intro(text: string) {
@@ -218,11 +218,20 @@ async function handleBackup(config: ReturnType<typeof loadConfig>) {
     }
   }
 
+  // If schemas preset in config.json, pre-check only those (e.g. ["public"] -> only public checked)
+  const presetSchemas = db.schemas && db.schemas.length > 0 ? db.schemas.map((s) => s.trim()).filter(Boolean) : null;
+  if (presetSchemas) {
+    logInfo(`Using schemas preset from config.json for "${dbKey}": ${presetSchemas.join(", ")} (pre-checked)`);
+  }
   let schemas: string[] = [];
   try {
     schemas = await checkbox({
       message: "Select schemas to backup (space to select, enter to confirm):",
-      choices: availableSchemas.map((s) => ({ value: s, name: s, checked: true })),
+      choices: availableSchemas.map((s) => ({
+        value: s,
+        name: s,
+        checked: presetSchemas ? presetSchemas.includes(s) : true,
+      })),
       required: false,
     });
   } catch {
@@ -230,54 +239,123 @@ async function handleBackup(config: ReturnType<typeof loadConfig>) {
     return;
   }
   const finalSchemas = schemas.length === 0 ? [] : schemas;
+  if (presetSchemas) {
+    const missing = presetSchemas.filter((s) => !availableSchemas.includes(s));
+    if (missing.length) logWarn(`Preset schemas not found in DB: ${missing.join(", ")} (available: ${availableSchemas.join(", ")})`);
+  }
 
-  // Table-level exclusion: fetch tables for selected schemas and allow user to choose
-  let excludeTables: string[] = [];
-  let excludeTableData: string[] = [];
-  // Only offer table selection if schemas selected and DB connection ok
-  if (ok && finalSchemas.length > 0) {
+  // Table-level selection: respect preset from config.json, else interactive whitelist/blacklist
+  let includeTables: string[] = [...(db.includeTables || [])];
+  let excludeTables: string[] = [...(db.excludeTables || [])];
+  let excludeTableData: string[] = [...(db.excludeTableData || [])];
+  const hasPreset = includeTables.length > 0 || excludeTables.length > 0 || excludeTableData.length > 0;
+
+  if (hasPreset) {
+    logInfo(`Using table filter from config.json for "${dbKey}":`);
+    if (includeTables.length) logInfo(`  includeTables (--table whitelist): ${includeTables.join(", ")}`);
+    if (excludeTables.length) logInfo(`  excludeTables (--exclude-table): ${excludeTables.join(", ")}`);
+    if (excludeTableData.length) logInfo(`  excludeTableData (--exclude-table-data): ${excludeTableData.join(", ")}`);
+    if (includeTables.length && (excludeTables.length || excludeTableData.length)) {
+      logWarn(`includeTables takes precedence — exclude* will be ignored (pg_dump --table whitelists)`);
+    }
+    // Still allow user to override preset interactively if they want
     try {
-      const wantExclude = await confirm({ message: "Exclude specific tables? (e.g., skip backup data for large tables)", default: false });
-      if (wantExclude) {
-        const tableSpinner = ora("Fetching tables...").start();
-        const allTables: string[] = [];
-        for (const sch of finalSchemas) {
-          const tbls = await getTables(config.pgBin, db, sch);
-          allTables.push(...tbls);
-        }
-        tableSpinner.succeed(`Found ${allTables.length} tables`);
-        if (allTables.length > 0) {
-          // Limit to first 100 for UI performance, or show all if < 50
-          const displayTables = allTables.slice(0, 100);
-          if (allTables.length > 100) {
-            logWarn(`Showing first 100 of ${allTables.length} tables (too many to display all). Use config.json for full list.`);
+      const usePreset = await confirm({ message: "Use table filter from config.json?", default: true });
+      if (!usePreset) {
+        includeTables = [];
+        excludeTables = [];
+        excludeTableData = [];
+        logInfo("Ignoring preset — switching to interactive selection");
+        // fall through to interactive
+        const tableMode = await select({
+          message: "Table selection (backup scope):",
+          choices: [
+            { value: "all", name: "All tables in selected schemas", description: "Backup semua tabel (default)" },
+            { value: "include", name: "Only selected tables", description: "Hanya backup tabel terpilih (--table)" },
+            { value: "exclude", name: "Exclude tables entirely", description: "Backup semua kecuali tabel terpilih (--exclude-table)" },
+            { value: "exclude-data", name: "Exclude data only", description: "Backup schema saja tanpa data (--exclude-table-data)" },
+          ],
+        });
+        if (tableMode !== "all" && ok) {
+          const schemasForTables = finalSchemas.length > 0 ? finalSchemas : availableSchemas;
+          const tableSpinner = ora("Fetching tables...").start();
+          const allTables: string[] = [];
+          for (const sch of schemasForTables) allTables.push(...(await getTables(config.pgBin, db, sch)));
+          tableSpinner.succeed(`Found ${allTables.length} tables in ${schemasForTables.join(", ")}`);
+          if (allTables.length > 0) {
+            const displayTables = allTables.slice(0, 100);
+            if (allTables.length > 100) logWarn(`Showing first 100 of ${allTables.length} tables`);
+            if (tableMode === "include") includeTables = (await checkbox({ message: "Select tables to BACKUP (whitelist --table):", choices: displayTables.map((t) => ({ value: t, name: t })), required: true })) as string[];
+            else if (tableMode === "exclude") excludeTables = (await checkbox({ message: "Select tables to EXCLUDE entirely (--exclude-table):", choices: displayTables.map((t) => ({ value: t, name: t })), required: false })) as string[];
+            else if (tableMode === "exclude-data") excludeTableData = (await checkbox({ message: "Select tables to EXCLUDE DATA only (--exclude-table-data):", choices: displayTables.map((t) => ({ value: t, name: t })), required: false })) as string[];
           }
-          const excludeChoice = await select({
-            message: "Exclude type:",
-            choices: [
-              { value: "none", name: "No, backup all tables" },
-              { value: "table", name: "Exclude tables entirely (--exclude-table)" },
-              { value: "data", name: "Exclude data only (--exclude-table-data, keep schema)" },
-            ],
-          });
-          if (excludeChoice !== "none") {
-            const picked = await checkbox({
-              message: `Select tables to ${excludeChoice === "table" ? "exclude entirely" : "exclude data"}:`,
-              choices: displayTables.map((t) => ({ value: t, name: t })),
-              required: false,
-            });
-            if (excludeChoice === "table") excludeTables = picked as string[];
-            else excludeTableData = picked as string[];
-          }
-        } else {
-          logWarn("No tables found for selected schemas.");
         }
       }
     } catch {
-      // ignore cancel
+      // keep preset on cancel
+    }
+  } else if (ok) {
+    try {
+      const tableMode = await select({
+        message: "Table selection (backup scope):",
+        choices: [
+          { value: "all", name: "All tables in selected schemas", description: "Backup semua tabel (default)" },
+          { value: "include", name: "Only selected tables", description: "Hanya backup tabel terpilih (--table)" },
+          { value: "exclude", name: "Exclude tables entirely", description: "Backup semua kecuali tabel terpilih (--exclude-table)" },
+          { value: "exclude-data", name: "Exclude data only", description: "Backup schema saja tanpa data (--exclude-table-data)" },
+        ],
+      });
+      if (tableMode !== "all") {
+        const schemasForTables = finalSchemas.length > 0 ? finalSchemas : availableSchemas;
+        if (schemasForTables.length === 0) {
+          logWarn("No schemas available for table discovery.");
+        } else {
+          const tableSpinner = ora("Fetching tables...").start();
+          const allTables: string[] = [];
+          for (const sch of schemasForTables) {
+            const tbls = await getTables(config.pgBin, db, sch);
+            allTables.push(...tbls);
+          }
+          tableSpinner.succeed(`Found ${allTables.length} tables in ${schemasForTables.join(", ")}`);
+          if (allTables.length > 0) {
+            const displayTables = allTables.slice(0, 100);
+            if (allTables.length > 100) {
+              logWarn(`Showing first 100 of ${allTables.length} tables (too many to display all). Use includeTables/excludeTables in config if needed.`);
+            }
+            if (tableMode === "include") {
+              const picked = await checkbox({
+                message: "Select tables to BACKUP (whitelist --table):",
+                choices: displayTables.map((t) => ({ value: t, name: t })),
+                required: true,
+              });
+              includeTables = picked as string[];
+              if (includeTables.length === 0) logWarn("No tables selected for include — will backup all.");
+            } else if (tableMode === "exclude") {
+              const picked = await checkbox({
+                message: "Select tables to EXCLUDE entirely (--exclude-table):",
+                choices: displayTables.map((t) => ({ value: t, name: t })),
+                required: false,
+              });
+              excludeTables = picked as string[];
+            } else if (tableMode === "exclude-data") {
+              const picked = await checkbox({
+                message: "Select tables to EXCLUDE DATA only (--exclude-table-data):",
+                choices: displayTables.map((t) => ({ value: t, name: t })),
+                required: false,
+              });
+              excludeTableData = picked as string[];
+            }
+          } else {
+            logWarn("No tables found for selected schemas.");
+          }
+        }
+      }
+    } catch {
+      // ignore cancel -> default all
     }
   } else if (!ok) {
-    logWarn("Skipping table discovery (no connection). You can still set excludeTables in config.json manually.");
+    logWarn("Skipping table discovery (no connection). You can still set includeTables/excludeTables manually via config.json.");
+    if (hasPreset) logInfo(`Will use preset from config despite no connection: ${[...includeTables, ...excludeTables, ...excludeTableData].join(", ")}`);
   }
 
   let formats: BackupFormat[] = [];
@@ -319,8 +397,10 @@ async function handleBackup(config: ReturnType<typeof loadConfig>) {
 
   logInfo(`Backup will be saved to: ${config.outputDir}`);
   logInfo(`Schemas: ${finalSchemas.length ? finalSchemas.join(", ") : "all"} | Formats: ${formats.join(", ")} | Jobs: ${jobs} (${jobs === "auto" ? "auto" : jobs} parallel${jobs === "auto" ? `, HT ${getCpuInfo().hyperThreading ? "ON" : "OFF"}` : ""})`);
+  if (includeTables.length) logInfo(`Include tables (whitelist --table): ${includeTables.join(", ")}`);
   if (excludeTables.length) logInfo(`Exclude tables: ${excludeTables.join(", ")}`);
   if (excludeTableData.length) logInfo(`Exclude data: ${excludeTableData.join(", ")}`);
+  if (includeTables.length) logWarn(`Whitelist mode: only ${includeTables.length} table(s) will be dumped (--table), --schema filter will be skipped`);
 
   let doBackup = false;
   try {
@@ -333,15 +413,205 @@ async function handleBackup(config: ReturnType<typeof loadConfig>) {
     return;
   }
 
-  const spin = ora("Backing up... (verbose per table)").start();
+  // Estimate total tables + bytes + per-table sizes for progress bar
+  let totalTables = 0;
+  let estimatedBytes = 0;
+  const tableSizes = new Map<string, number>(); // per-table total size for Bytes per-table bar
+  const tableDataSizes = new Map<string, number>(); // data-only size for exclude-data
+  try {
+    if (ok) {
+      if (includeTables.length > 0) {
+        totalTables = includeTables.length;
+        let sum = 0;
+        for (const t of includeTables) {
+          try {
+            const sz = await getTableSize(config.pgBin, db, t);
+            tableSizes.set(t, sz);
+            sum += sz;
+          } catch {}
+        }
+        estimatedBytes = sum;
+        if (estimatedBytes === 0) {
+          try { const s = await getDatabaseSize(config.pgBin, db); estimatedBytes = parseSizeToBytes(s); } catch {}
+        }
+      } else {
+        const schemasForCount = finalSchemas.length > 0 ? finalSchemas : availableSchemas;
+        for (const sch of schemasForCount) totalTables += await getTableCount(config.pgBin, db, sch);
+        if (totalTables > 0 && excludeTables.length > 0) totalTables = Math.max(0, totalTables - excludeTables.length);
+        try { const s = await getDatabaseSize(config.pgBin, db); estimatedBytes = parseSizeToBytes(s); } catch {}
+        if (estimatedBytes > 0) {
+          if (excludeTables.length > 0) {
+            let excl = 0;
+            for (const t of excludeTables) {
+              try {
+                const sz = await getTableSize(config.pgBin, db, t);
+                tableSizes.set(t, sz);
+                excl += sz;
+              } catch {}
+            }
+            estimatedBytes = Math.max(0, estimatedBytes - excl);
+          }
+          if (excludeTableData.length > 0) {
+            let exclData = 0;
+            for (const t of excludeTableData) {
+              try {
+                const dsz = await getTableDataSize(config.pgBin, db, t);
+                const tsz = dsz || Math.round((await getTableSize(config.pgBin, db, t)) * 0.7);
+                tableDataSizes.set(t, tsz);
+                exclData += tsz;
+              } catch {}
+            }
+            estimatedBytes = Math.max(0, estimatedBytes - exclData);
+          }
+        }
+        if (estimatedBytes === 0 && totalTables > 0) {
+          try { const s = await getDatabaseSize(config.pgBin, db); estimatedBytes = parseSizeToBytes(s); } catch {}
+        }
+        // Pre-fetch per-table sizes for all tables in selected schemas for per-table Bytes bar (single query, efficient)
+        if (totalTables > 0 && totalTables <= 400) {
+          try {
+            const allSizes = await getTablesWithSizes(config.pgBin, db, schemasForCount);
+            for (const [k, v] of allSizes) if (!tableSizes.has(k)) tableSizes.set(k, v);
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+  // Dual progressbar: bar 1 = tables (overall), bar 2 = bytes per-table (current table being dumped)
+  const startTime = Date.now();
+  let processedTables = 0;
+  let lastShort = "starting...";
+  let writtenBytes = 0;
+  let currentTableName: string | null = null;
+  let currentTableSize = 0;
+  let currentTableStartBytes = 0;
+  const expectedFolderBase = join(config.outputDir, `${db.database}_${ts}`);
 
-  const onProgress = (msg: string) => {
-    const short = msg.length > 80 ? msg.slice(0, 80) + "..." : msg;
-    spin.text = short;
+  const pollBytes = () => {
+    try {
+      let folder = expectedFolderBase;
+      if (!existsSync(folder)) {
+        for (let i = 1; i <= 5; i++) {
+          const alt = `${expectedFolderBase}_${i}`;
+          if (existsSync(alt)) { folder = alt; break; }
+        }
+        if (!existsSync(folder)) return 0;
+      }
+      let total = 0;
+      const stack: string[] = [folder];
+      while (stack.length) {
+        const dir = stack.pop()!;
+        let entries: any[] = [];
+        try { entries = readdirSync(dir, { withFileTypes: true } as any); } catch { continue; }
+        for (const e of entries) {
+          const p = join(dir, e.name);
+          if (e.isDirectory()) stack.push(p);
+          else try { total += statSync(p).size; } catch {}
+        }
+      }
+      return total;
+    } catch { return 0; }
   };
 
+  const extractTableName = (msg: string): string | null => {
+    let m = msg.match(/dumping contents of table\s+"([^"]+)"\."([^"]+)"/i);
+    if (m) return `${m[1]}.${m[2]}`;
+    m = msg.match(/dumping contents of table\s+"([^"]+)"/i);
+    if (m) {
+      const raw = m[1]!.replace(/"/g, "");
+      if (raw.includes(".")) return raw;
+      return `public.${raw}`;
+    }
+    m = msg.match(/dumping contents of table\s+([^\s]+)/i);
+    if (m) return m[1]!.replace(/"/g, "").replace(/,$/, "");
+    return null;
+  };
+
+  // Use cli-progress MultiBar for 2 stacked bars + status line below
+  const { default: cliProgress } = await import("cli-progress");
+  const padLeft = (s: string, w: number) => s.padStart(w);
+  const pctStr = (cur: number, total: number) => {
+    if (total <= 0) return "  0%".padStart(4);
+    const p = Math.round((Math.min(cur, total) / total) * 100);
+    return `${String(p).padStart(3)}%`;
+  };
+  const valueWidth = 20;
+  const pctWidth = 4;
+  const elapsedWidth = 8;
+  const multibar = new cliProgress.MultiBar({
+    clearOnComplete: false,
+    hideCursor: true,
+    barCompleteChar: "█",
+    barIncompleteChar: "░",
+    barsize: 22,
+    format: `{bar} {pctStr} | {valueStr} | {elapsedStr}`,
+    stopOnComplete: false,
+  }, cliProgress.Presets.shades_classic);
+
+  const tableTotal = totalTables || 1;
+  const tableBar = multibar.create(tableTotal, 0, {
+    pctStr: padLeft("0%", pctWidth),
+    valueStr: padLeft(`0/${totalTables || "?"}`, valueWidth),
+    elapsedStr: padLeft("0s", elapsedWidth),
+  });
+  tableBar.setTotal(tableTotal);
+  // Status line below progressbar: only pg_dump message (time now in bar)
+  const statusBar = multibar.create(1, 1, { status: chalk.dim("starting...") }, {
+    format: ` {status}`,
+    barCompleteChar: " ",
+    barIncompleteChar: " ",
+    barsize: 0,
+  });
+  // Ensure bars start at 0
+  tableBar.update(0, {
+    pctStr: padLeft(pctStr(0, tableTotal), pctWidth),
+    valueStr: padLeft(`0/${totalTables || "?"}`, valueWidth),
+    elapsedStr: padLeft("0s", elapsedWidth),
+  });
+  statusBar.update(1, { status: chalk.dim(`starting...`) });
+
+  let pollTimer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    writtenBytes = pollBytes();
+    const elapsed = formatDuration(Date.now() - startTime);
+    const curTable = Math.min(processedTables, tableTotal);
+    tableBar.update(curTable, {
+      pctStr: padLeft(pctStr(curTable, tableTotal), pctWidth),
+      valueStr: padLeft(`${curTable}/${totalTables || "?"}`, valueWidth),
+      elapsedStr: padLeft(elapsed, elapsedWidth),
+    });
+    statusBar.update(1, { status: chalk.dim(lastShort) });
+  }, 600);
+
+  const onProgress = (msg: string) => {
+    const short = msg.length > 65 ? msg.slice(0, 65) + "..." : msg;
+    lastShort = short;
+    const lower = msg.toLowerCase();
+    if (lower.includes("dumping contents of table") || lower.includes("dumping table") || lower.includes("processing table")) {
+      const tbl = extractTableName(msg);
+      if (tbl) {
+        currentTableName = tbl;
+        let sz = tableSizes.get(tbl) || 0;
+        if (!sz) for (const [k, v] of tableSizes) if (k.toLowerCase() === tbl.toLowerCase()) { sz = v; break; }
+        if (!sz) sz = tableDataSizes.get(tbl) || 0;
+        if (sz) lastShort = `${short} • ${prettyBytes(sz)}`;
+      }
+      processedTables++;
+    }
+    const elapsed = formatDuration(Date.now() - startTime);
+    const curTable = Math.min(processedTables, tableTotal);
+    tableBar.update(curTable, {
+      pctStr: padLeft(pctStr(curTable, tableTotal), pctWidth),
+      valueStr: padLeft(`${curTable}/${totalTables || "?"}`, valueWidth),
+      elapsedStr: padLeft(elapsed, elapsedWidth),
+    });
+    statusBar.update(1, { status: chalk.dim(short) });
+  };
+
+  let files: string[] = [];
+  let log = "";
+  let folder = "";
   try {
-    const { files, log, folder } = await backupDatabase({
+    const result = await backupDatabase({
       pgBin: config.pgBin,
       db,
       schemas: finalSchemas,
@@ -350,10 +620,45 @@ async function handleBackup(config: ReturnType<typeof loadConfig>) {
       jobs,
       timestamp: ts,
       onProgress,
+      includeTables,
       excludeTables,
       excludeTableData,
     });
-    spin.succeed("Backup completed");
+    files = result.files;
+    log = result.log;
+    folder = result.folder;
+    if (pollTimer) clearInterval(pollTimer);
+    writtenBytes = pollBytes();
+    const totalElapsed = formatDuration(Date.now() - startTime);
+    // Force bar to 100% at done
+    const tableValFinal = `${totalTables || processedTables}/${totalTables || processedTables}`;
+    tableBar.update(tableTotal, {
+      pctStr: padLeft("100%", pctWidth),
+      valueStr: padLeft(tableValFinal, valueWidth),
+      elapsedStr: padLeft(totalElapsed, elapsedWidth),
+    });
+    statusBar.update(1, { status: chalk.dim(`done • ${prettyBytes(writtenBytes)}`) });
+    multibar.stop();
+    // Tampilkan size backup yang sebenarnya (total file di folder)
+    const totalBackupSize = (() => {
+      try {
+        let total = 0;
+        const stack: string[] = [folder];
+        while (stack.length) {
+          const dir = stack.pop()!;
+          let entries: any[] = [];
+          try { entries = readdirSync(dir, { withFileTypes: true } as any); } catch { continue; }
+          for (const e of entries) {
+            const p = join(dir, e.name);
+            if (e.isDirectory()) stack.push(p);
+            else try { total += statSync(p).size; } catch {}
+          }
+        }
+        return total;
+      } catch { return writtenBytes; }
+    })();
+    console.log(chalk.green(`✔ Backup completed ${tableValFinal} tables • ${prettyBytes(totalBackupSize)} • ${totalElapsed}`));
+    console.log(chalk.cyan(`  Backup size: ${prettyBytes(totalBackupSize)} • ${folder}`));
 
     logSuccess(`Folder created: ${folder}`);
     logSuccess(`Files created:`);
@@ -401,7 +706,9 @@ async function handleBackup(config: ReturnType<typeof loadConfig>) {
       } catch {}
     }
   } catch (e: any) {
-    spin.fail("Backup failed");
+    if (pollTimer) clearInterval(pollTimer);
+    try { multibar.stop(); } catch {}
+    console.log(chalk.red(`✖ Backup failed: ${e.message}`));
     logError(e.message);
   }
 }
@@ -585,10 +892,54 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
   const cpu = getCpuInfo();
   const jobs = getEffectiveJobs(config.jobs);
   logInfo(`Restore jobs: ${jobs} (logical:${cpu.logical}, HT:${cpu.hyperThreading ? "ON" : "OFF"})`);
-  const spin = ora("Restoring...").start();
+  const isDirDump = (() => { try { return statSync(dumpFile).isDirectory(); } catch { return false; } })();
+  let estimatedRestoreTotal = 0;
+  // Estimate total objects for progress: for directory dump count files, for sql estimate lines, else guess
+  try {
+    if (isDirDump) {
+      const tocFiles = readdirSync(dumpFile);
+      // directory dumps have many .dat.gz + toc.dat; use file count as proxy
+      estimatedRestoreTotal = tocFiles.length;
+    } else if (dumpFile.endsWith(".sql")) {
+      const st = statSync(dumpFile);
+      // rough: 1 object per ~50KB guess, or at least 1
+      estimatedRestoreTotal = Math.max(1, Math.round(st.size / (50 * 1024)));
+    } else {
+      // custom/tar: guess from file size
+      const st = statSync(dumpFile);
+      estimatedRestoreTotal = Math.max(1, Math.round(st.size / (100 * 1024)));
+    }
+  } catch {}
+  const restoreStart = Date.now();
+  let restoredCount = 0;
+  const restoreInitialBar = estimatedRestoreTotal ? ` ${renderBar(0, estimatedRestoreTotal)}` : "";
+  const restoreInitialCounter = estimatedRestoreTotal ? `0/${estimatedRestoreTotal} objects` : "0 objects";
+  const spin = ora(`Restoring... ${restoreInitialCounter}${restoreInitialBar}`).start();
 
   const onProgress = (msg: string) => {
-    spin.text = msg.slice(0, 80);
+    const short = msg.slice(0, 70);
+    const lower = msg.toLowerCase();
+    // pg_restore/psql verbose lines often contain "processing", "restoring", "creating", "table", "index"
+    if (lower.includes("processing") || lower.includes("restoring") || lower.includes("creating") || lower.includes("executing") || lower.includes("table") ) {
+      // Avoid counting duplicate for same msg? count each verbose line as 1 object
+      // For psql plain SQL, each "INSERT" or "CREATE" is an object
+      if (lower.includes("table") || lower.includes("index") || lower.includes("sequence") || lower.includes("constraint") || lower.includes("data") || lower.includes("processing")) {
+        restoredCount++;
+      }
+    }
+    // Also count generic pg_restore progress lines
+    if (lower.includes("pg_restore:") && !lower.includes("table")) {
+      // still count as progress tick if no table keyword
+      // throttle to avoid overcount: only if not already counted
+      if (!lower.includes("table") && !lower.includes("index") && restoredCount < estimatedRestoreTotal) {
+        // leave as is, don't double increment
+      }
+    }
+    const elapsed = formatDuration(Date.now() - restoreStart);
+    // For restore, if we have estimate, show bar with capped count
+    const bar = estimatedRestoreTotal ? renderBar(Math.min(restoredCount, estimatedRestoreTotal), estimatedRestoreTotal) : "";
+    const counter = estimatedRestoreTotal ? `${Math.min(restoredCount, estimatedRestoreTotal)}/${estimatedRestoreTotal} objects` : `${restoredCount} objects`;
+    spin.text = `${bar} ${counter} • ${elapsed} • ${short}`;
   };
 
   try {
@@ -599,7 +950,9 @@ async function handleRestore(config: ReturnType<typeof loadConfig>) {
       jobs,
       onProgress,
     });
-    spin.succeed("Restore completed");
+    const totalElapsed = formatDuration(Date.now() - restoreStart);
+    const finalBar = estimatedRestoreTotal ? renderBar(Math.min(restoredCount, estimatedRestoreTotal), estimatedRestoreTotal) : "";
+    spin.succeed(`Restore completed ${finalBar} ${restoredCount}/${estimatedRestoreTotal || "?"} objects • ${totalElapsed}`);
     logSuccess(`Restored ${basename(dumpFile)} -> ${target.database}`);
   } catch (e: any) {
     spin.fail("Restore failed");

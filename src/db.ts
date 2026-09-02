@@ -15,8 +15,9 @@ interface BackupOptions {
   jobs: number | "auto";
   timestamp: string;
   onProgress?: (msg: string) => void;
-  excludeTables?: string[]; // e.g. ["public.history_api"]
-  excludeTableData?: string[]; // e.g. ["public.temp_transaksi"]
+  includeTables?: string[]; // e.g. ["public.users", "public.orders"] -> --table (whitelist)
+  excludeTables?: string[]; // e.g. ["public.history_api"] -> --exclude-table
+  excludeTableData?: string[]; // e.g. ["public.temp_transaksi"] -> --exclude-table-data
 }
 
 interface RestoreOptions {
@@ -58,6 +59,14 @@ function getPsqlPath(pgBin: string): string {
 function buildSchemaArgs(schemas: string[]): string[] {
   if (!schemas || schemas.length === 0) return [];
   return schemas.flatMap((s) => ["--schema", s]);
+}
+
+function escapeSqlLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+function escapeSqlIdentifier(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 // Robust run using node:child_process, not Bun.spawn (avoids segfault on large DB)
@@ -127,7 +136,8 @@ export async function testConnection(pgBin: string, db: DatabaseConfig): Promise
 export async function getDatabaseSize(pgBin: string, db: DatabaseConfig): Promise<string> {
   const psql = getPsqlPath(pgBin);
   const env = { PGPASSWORD: db.password };
-  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-c", `SELECT pg_size_pretty(pg_database_size('${db.database}'));`];
+  const safeDb = escapeSqlLiteral(db.database);
+  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-c", `SELECT pg_size_pretty(pg_database_size('${safeDb}'));`];
   return new Promise<string>((resolve) => {
     const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
@@ -140,7 +150,8 @@ export async function getDatabaseSize(pgBin: string, db: DatabaseConfig): Promis
 export async function getTableCount(pgBin: string, db: DatabaseConfig, schema: string = "public"): Promise<number> {
   const psql = getPsqlPath(pgBin);
   const env = { PGPASSWORD: db.password };
-  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-c", `SELECT count(*) FROM information_schema.tables WHERE table_schema='${schema}';`];
+  const safeSchema = escapeSqlLiteral(schema);
+  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-c", `SELECT count(*) FROM information_schema.tables WHERE table_schema='${safeSchema}';`];
   return new Promise<number>((resolve) => {
     const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
@@ -173,11 +184,94 @@ export async function getSchemas(pgBin: string, db: DatabaseConfig): Promise<str
   });
 }
 
+export async function getTableDataSize(pgBin: string, db: DatabaseConfig, table: string): Promise<number> {
+  const psql = getPsqlPath(pgBin);
+  const env = { PGPASSWORD: db.password };
+  const safeTable = escapeSqlLiteral(table);
+  // pg_relation_size = only table data (without indexes), for --exclude-table-data
+  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-A", "-c", `SELECT pg_relation_size('${safeTable}'::regclass);`];
+  return new Promise<number>((resolve) => {
+    const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("close", () => {
+      const n = parseInt(out.trim() || "0", 10);
+      resolve(isNaN(n) ? 0 : n);
+    });
+    child.on("error", () => resolve(0));
+  });
+}
+
+export async function getTableSize(pgBin: string, db: DatabaseConfig, table: string): Promise<number> {
+  const psql = getPsqlPath(pgBin);
+  const env = { PGPASSWORD: db.password };
+  const safeTable = escapeSqlLiteral(table);
+  // Use ::regclass to handle schema-qualified names like 'public.users'
+  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-A", "-c", `SELECT pg_total_relation_size('${safeTable}'::regclass);`];
+  return new Promise<number>((resolve) => {
+    const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("close", () => {
+      const n = parseInt(out.trim() || "0", 10);
+      resolve(isNaN(n) ? 0 : n);
+    });
+    child.on("error", () => resolve(0));
+  });
+}
+
+export async function getTablesWithSizes(pgBin: string, db: DatabaseConfig, schemas: string[]): Promise<Map<string, number>> {
+  const psql = getPsqlPath(pgBin);
+  const env = { PGPASSWORD: db.password };
+  const result = new Map<string, number>();
+  if (schemas.length === 0) return result;
+  const schemaList = schemas.map((s) => `'${escapeSqlLiteral(s)}'`).join(",");
+  const cmd = [
+    psql,
+    "-h",
+    db.host,
+    "-p",
+    String(db.port),
+    "-U",
+    db.username,
+    "-d",
+    db.database,
+    "-t",
+    "-A",
+    "-F",
+    "|",
+    "-c",
+    `SELECT schemaname, tablename, pg_total_relation_size(schemaname||'.'||quote_ident(tablename)::regclass) FROM pg_tables WHERE schemaname IN (${schemaList}) ORDER BY schemaname, tablename;`,
+  ];
+  return new Promise<Map<string, number>>((resolve) => {
+    const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("close", (code) => {
+      if (code !== 0) resolve(result);
+      else {
+        for (const line of out.split("\n")) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          const [sch, tbl, sz] = trimmed.split("|");
+          if (sch && tbl) {
+            const key = `${sch}.${tbl}`;
+            const n = parseInt(sz || "0", 10);
+            result.set(key, isNaN(n) ? 0 : n);
+          }
+        }
+        resolve(result);
+      }
+    });
+    child.on("error", () => resolve(result));
+  });
+}
+
 export async function getTables(pgBin: string, db: DatabaseConfig, schema: string): Promise<string[]> {
   const psql = getPsqlPath(pgBin);
   const env = { PGPASSWORD: db.password };
-  // Use pg_tables for including all tables, or information_schema for base tables
-  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-A", "-c", `SELECT tablename FROM pg_tables WHERE schemaname='${schema}' ORDER BY tablename;`];
+  const safeSchema = escapeSqlLiteral(schema);
+  const cmd = [psql, "-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-t", "-A", "-c", `SELECT tablename FROM pg_tables WHERE schemaname='${safeSchema}' ORDER BY tablename;`];
   return new Promise<string[]>((resolve) => {
     const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
@@ -207,7 +301,7 @@ export function getEffectiveJobs(jobs: number | "auto" | undefined): number {
 }
 
 export async function backupDatabase(opts: BackupOptions): Promise<{ files: string[]; log: string; folder: string }> {
-  const { pgBin, db, schemas, formats, outputDir, jobs: rawJobs, timestamp, onProgress, excludeTables, excludeTableData } = opts;
+  const { pgBin, db, schemas, formats, outputDir, jobs: rawJobs, timestamp, onProgress, includeTables, excludeTables, excludeTableData } = opts;
   const pgDump = getPgDumpPath(pgBin);
   const env = { PGPASSWORD: db.password };
   const jobs = getEffectiveJobs(rawJobs);
@@ -229,19 +323,31 @@ export async function backupDatabase(opts: BackupOptions): Promise<{ files: stri
   appendFileSync(logFile, `Schemas: ${schemas.length ? schemas.join(", ") : "all"}\n`);
   appendFileSync(logFile, `Formats: ${formats.join(", ")}\n`);
   appendFileSync(logFile, `Jobs: ${jobs} (logical:${cpu.logical}, physical:${cpu.physical}, HT:${cpu.hyperThreading ? "yes" : "no"})\n`);
+  if (includeTables?.length) appendFileSync(logFile, `Include Tables (--table): ${includeTables.join(", ")}\n`);
   if (excludeTables?.length) appendFileSync(logFile, `Exclude Tables: ${excludeTables.join(", ")}\n`);
   if (excludeTableData?.length) appendFileSync(logFile, `Exclude Data: ${excludeTableData.join(", ")}\n`);
   appendFileSync(logFile, `PG_BIN: ${pgDump}\n\n`);
 
-  const schemaArgs = buildSchemaArgs(schemas);
+  // includeTables (whitelist) is mutually exclusive with schema filter and exclude
+  // pg_dump: -n public + -t public.a dumps ALL in public, so when whitelist is set we skip --schema
+  const hasInclude = !!(includeTables && includeTables.length > 0);
+  const schemaArgs = hasInclude ? [] : buildSchemaArgs(schemas);
+  const includeArgs: string[] = [];
+  if (hasInclude) {
+    for (const t of includeTables!) includeArgs.push("--table", t);
+  }
   const excludeArgs: string[] = [];
-  if (excludeTables?.length) {
-    for (const t of excludeTables) excludeArgs.push("--exclude-table", t);
+  if (!hasInclude) {
+    if (excludeTables?.length) {
+      for (const t of excludeTables) excludeArgs.push("--exclude-table", t);
+    }
+    if (excludeTableData?.length) {
+      for (const t of excludeTableData) excludeArgs.push("--exclude-table-data", t);
+    }
+  } else if (excludeTables?.length || excludeTableData?.length) {
+    appendFileSync(logFile, `[WARN] includeTables set — ignoring excludeTables/excludeTableData\n`);
   }
-  if (excludeTableData?.length) {
-    for (const t of excludeTableData) excludeArgs.push("--exclude-table-data", t);
-  }
-  const baseArgs = ["-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-v", ...excludeArgs];
+  const baseArgs = ["-h", db.host, "-p", String(db.port), "-U", db.username, "-d", db.database, "-v", ...excludeArgs, ...includeArgs];
 
   for (const fmt of formats) {
     let outPath: string;
@@ -391,7 +497,8 @@ export async function restoreDatabase(opts: RestoreOptions): Promise<void> {
   if (target.createIfNotExists) {
     onProgress?.(`Checking if database ${target.database} exists...`);
     const psql = getPsqlPath(pgBin);
-    const createCmd = [psql, "-h", target.host, "-p", String(target.port), "-U", target.username, "-d", "postgres", "-c", `CREATE DATABASE "${target.database}";`];
+    const safeIdent = escapeSqlIdentifier(target.database);
+    const createCmd = [psql, "-h", target.host, "-p", String(target.port), "-U", target.username, "-d", "postgres", "-c", `CREATE DATABASE ${safeIdent};`];
     const exit = await new Promise<number>((resolve) => {
       const child = spawn(createCmd[0]!, createCmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
       let stderr = "";

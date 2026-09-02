@@ -13,12 +13,12 @@ Lokasi: `D:\database-tools` atau `~/database-tools` — output di dalam direktor
 - **Restore:** pilih file dump dari `backups/` → pilih target DB → `--clean --if-exists` + parallel
 - **Format:** `tar`, `custom` (`.dump`, paling cepat & kecil, `pg_restore`), `plain` (`.sql`), `directory` (`-Fd -j`, paling cepat untuk DB besar)
 - **Hyper-threading:** `jobs: "auto"` di `config.json` → deteksi `os.availableParallelism()` / `os.cpus().length` (contoh: `20 logical / 10 physical — HT YES` → `-j 20` untuk `pg_dump -Fd` dan `pg_restore -j`)
-- **Pilih tabel:** setelah pilih schemas, bisa `Exclude specific tables?` → `Exclude entirely (--exclude-table)` atau `Exclude data only (--exclude-table-data)`
+- **Pilih tabel:** setelah pilih schemas, pilih scope: `All` / `Only selected (--table whitelist)` / `Exclude entirely (--exclude-table)` / `Exclude data only (--exclude-table-data)` — bisa interaktif atau preset dari `config.json` (`includeTables`/`excludeTables`/`excludeTableData`)
 - **Schema auto-discovery:** `SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg_%' ...` langsung dari DB — **tidak perlu `schemas` di `config.json`** (jika kosong, fallback `public`)
 - **Timestamp:** `20260901_100735` (`YYYYMMDD_HHMMSS` eksplisit `Asia/Jakarta` WIB via `Intl.DateTimeFormat`, bukan GMT/system)
 - **Folder:** selalu buat folder dulu `backups/{nama_database}_{timestamp}/` berisi `*.tar`/`*.dump`/`*.sql`/`*_dir/` + `backup_*.log`
 - **Cross-platform:** `pgBin` kosong → pakai `pg_dump` di `PATH` (Linux `which`, Windows `where`, macOS `brew`). Jika tidak ada, **auto-download** PostgreSQL binaries (~80-200MB) dari `get.enterprisedb.com` ke `bin/pgsql/bin` (Windows `.zip` via `Expand-Archive`, Linux/macOS `.tar.gz` via `tar`)
-- **Progress:** verbose `pg_dump -v` per tabel (`dumping contents of table ...`) + `Size: X MB` + spinner, log ke `backups/{db}_{timestamp}/backup_*.log`
+- **Progress:** `cli-progress` single bar `Tables` (`██████████████████████ 100% | 9999/9999 | 1m 05s` + `pg_dump: dumping...` di baris bawah, `|` sejajar, `Bytes` dihapus karena terkompres tidak akurat), `pg_dump -v` verbose, log ke `backups/{db}_{timestamp}/backup_*.log`
 - **Robust:** pakai `node:child_process.spawn` (bukan `Bun.spawn` pipe) anti-segfault untuk DB besar (132 GB)
 
 ## Persyaratan
@@ -34,6 +34,7 @@ Lokasi: `D:\database-tools` atau `~/database-tools` — output di dalam direktor
 ```bash
 cd D:\database-tools
 # atau cd ~/Projects/BunProjects/database-tools
+
 bun install
 
 # config: copy template dan isi kredensial
@@ -60,7 +61,11 @@ cp config.example.json config.json
       "port": 5432,
       "database": "open-po",
       "username": "postgres",
-      "password": "YOUR_SECRET_PASSWORD"
+      "password": "YOUR_SECRET_PASSWORD",
+      "schemas": ["public"],
+      "includeTables": ["public.users", "public.orders", "public.products"],
+      "excludeTables": [],
+      "excludeTableData": []
     }
   },
   "restoreTargets": {
@@ -80,6 +85,10 @@ cp config.example.json config.json
 - `outputDir`: `./backups` (di dalam aplikasi, sesuai request) — bisa absolute `C:\Backup\Database` atau `D:\Backup`
 - `jobs`: `"auto"` (deteksi hyper-threading) atau angka `4`, `8`, `20`
 - `databases`: tanpa `schemas` — akan auto-discover dari DB (`public`, dll). Jika ingin paksa, tambah `"schemas": ["public"]`
+  - `includeTables`: whitelist hanya tabel terpilih (`--table`), contoh `["public.users","public.orders"]` — jika diisi, `exclude*` diabaikan dan `--schema` di-skip (karena `pg_dump -n public -t public.a` akan dump semua)
+  - `excludeTables`: blacklist skip tabel penuh (`--exclude-table`), contoh `["public.audit_log"]`
+  - `excludeTableData`: skip data saja (`--exclude-table-data`), contoh `["public.history_api"]` — schema tetap ter-backup, data tidak
+  - Jika `includeTables`/`excludeTables` diisi di `config.json`, CLI akan pakai preset otomatis (skip prompt interaktif), tapi masih tanya konfirmasi `Use table filter from config.json?`
 - `restoreTargets`: tujuan restore, `createIfNotExists: true` akan `CREATE DATABASE` jika belum ada
 
 ## Penggunaan
@@ -100,9 +109,9 @@ bun run dev
 4. `CPU: 20 logical / 10 physical — Hyper-Threading: YES → optimal jobs: 20` → `Use auto jobs (20)?`
 5. `Discovering schemas...` → `Found schemas: backup, public (auto-discovered)` (atau fallback `public`)
 6. `Select schemas to backup:` → checklist (default semua tercentang)
-7. `Exclude specific tables?` → jika Ya → pilih exclude type (`table` vs `data`) → checklist tabel (auto `getTables()` per schema)
+7. `Table selection:` → `All` / `Only selected (--table)` / `Exclude entirely (--exclude-table)` / `Exclude data only (--exclude-table-data)` → jika preset ada di `config.json` maka `Using table filter from config.json` → `Use table filter from config.json?` (skip fetch)
 8. `Select backup formats:` → `tar`/`custom`/`plain`/`directory` (default `tar`+`custom`)
-9. `Backup will be saved to: .../backups` → `Start backup?` → progress `Backing up...` + verbose per tabel → `Folder created: .../open-po_20260901_100735/` + `Files created` + `Log`
+9. `Backup will be saved to: .../backups` → `Schemas: ... | Include: ... | Exclude: ...` → `Start backup?` → progress `██████████████████████ 100% | 9999/9999 | 1m 05s` + `pg_dump: ...` di baris bawah (`|` sejajar) → `Backup completed 9999/9999 tables • 338.90 KB • 1m 05s` + `Backup size: 338.90 KB` + `Folder created: .../open-po_20260901_100735/` + `Files created` + `Log`
 
 **Alur Restore:**
 1. `Restore` → `Select dump file:` → list `open-po_20260901_100735/open-po_20260901_100735.sql — 60.48 KB — 2026-09-01 ...` (support legacy file di `backups/` dan folder baru)
@@ -127,7 +136,8 @@ bun run build:all
 Zip sebelum push tag:
 
 ```bash
-bun run build:zip        # zip dist/* yang sudah ada (38M/35M/25M/27M)
+# zip dist/* yang sudah ada
+bun run build:zip
 # atau build + zip 1 perintah
 bun run build:all:zip
 gh release create v1.0.0 dist/*.zip --generate-notes

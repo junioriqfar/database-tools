@@ -67,19 +67,69 @@ export function sleep(ms: number): Promise<void> {
 }
 
 export function getCpuInfo(): { physical: number; logical: number; hyperThreading: boolean } {
-  try {
-    const { cpus } = require("node:os");
-    const all = cpus();
-    const logical = all.length;
-    // Count unique physical cores by model + core mapping (best effort)
-    const cores = new Set(all.map((c: any) => `${c.model}-${c.speed}`));
-    // More accurate: count distinct physical id via /proc/cpuinfo not available, fallback to logical/2 if hyper-threading
-    const physical = Math.max(1, Math.ceil(logical / 2));
-    // Hyper-threading if logical > physical
-    return { physical, logical, hyperThreading: logical > physical };
-  } catch {
-    return { physical: 1, logical: 1, hyperThreading: false };
-  }
+  const logical = (() => {
+    try {
+      const { cpus } = require("node:os");
+      return Math.max(1, cpus().length);
+    } catch {
+      return 1;
+    }
+  })();
+
+  const physical = (() => {
+    try {
+      const { execSync } = require("node:child_process") as typeof import("node:child_process");
+      if (process.platform === "linux") {
+        // Try nproc --all for logical already, need physical: lscpu or /proc/cpuinfo
+        try {
+          const out = execSync("lscpu -p 2>/dev/null | grep -v '^#' | cut -d, -f2 | sort -u | wc -l", { encoding: "utf-8" }).trim();
+          const n = parseInt(out, 10);
+          if (!isNaN(n) && n > 0 && n <= logical) return n;
+        } catch {}
+        try {
+          const { readFileSync } = require("node:fs") as typeof import("node:fs");
+          const cpuinfo = readFileSync("/proc/cpuinfo", "utf-8");
+          const cores = cpuinfo.match(/^cpu cores\s*:\s*(\d+)/m);
+          if (cores) {
+            const perSocket = parseInt(cores[1]!, 10);
+            const sockets = (cpuinfo.match(/^physical id\s*:/gm) || []).length || 1;
+            const ids = new Set((cpuinfo.match(/^physical id\s*:\s*(\d+)/gm) || []).map((s) => s.trim()));
+            const socketCount = ids.size || sockets;
+            const total = perSocket * socketCount;
+            if (!isNaN(total) && total > 0 && total <= logical) return total;
+          }
+        } catch {}
+      }
+      if (process.platform === "darwin") {
+        try {
+          const out = execSync("sysctl -n hw.physicalcpu 2>/dev/null", { encoding: "utf-8" }).trim();
+          const n = parseInt(out, 10);
+          if (!isNaN(n) && n > 0 && n <= logical) return n;
+        } catch {}
+      }
+      if (process.platform === "win32") {
+        try {
+          const out = execSync("wmic cpu get NumberOfCores /value 2>nul", { encoding: "utf-8" });
+          const m = out.match(/NumberOfCores=(\d+)/);
+          if (m) {
+            const n = parseInt(m[1]!, 10);
+            if (!isNaN(n) && n > 0 && n <= logical) return n;
+          }
+        } catch {}
+        // PowerShell fallback
+        try {
+          const out = execSync('powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).NumberOfCores"', { encoding: "utf-8" }).trim();
+          const n = parseInt(out.split(/\s+/)[0]!, 10);
+          if (!isNaN(n) && n > 0 && n <= logical) return n;
+        } catch {}
+      }
+    } catch {}
+    // Heuristic fallback: assume HT enabled if logical > 1 => physical = ceil(logical/2)
+    // For non-HT CPUs logical == physical, heuristic overestimates HT but still safe for -j
+    return Math.max(1, Math.ceil(logical / 2));
+  })();
+
+  return { physical, logical, hyperThreading: logical > physical };
 }
 
 export function getOptimalJobs(): number {
@@ -95,4 +145,33 @@ export function getOptimalJobs(): number {
   } catch {
     return 4;
   }
+}
+
+export function renderBar(current: number, total: number, width = 20): string {
+  if (total <= 0) return "";
+  const ratio = Math.min(1, Math.max(0, current / total));
+  const filled = Math.round(ratio * width);
+  const empty = width - filled;
+  const pct = Math.round(ratio * 100);
+  const bar = "█".repeat(filled) + "░".repeat(empty);
+  return `${bar} ${pct}%`;
+}
+
+export function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}h ${m % 60}m ${s % 60}s`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+export function parseSizeToBytes(sizeStr: string): number {
+  // e.g. "132 GB", "60.48 KB", "unknown"
+  const m = sizeStr.trim().match(/^([\d.]+)\s*([KMGT]?B)?/i);
+  if (!m) return 0;
+  const num = parseFloat(m[1]!);
+  const unit = (m[2] || "B").toUpperCase();
+  const mult: Record<string, number> = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+  return Math.round(num * (mult[unit] || 1));
 }
