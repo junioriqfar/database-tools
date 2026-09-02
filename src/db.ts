@@ -69,6 +69,9 @@ function escapeSqlIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+// Track active child for SIGINT cleanup (avoid orphan pg_dump/pg_restore on close)
+let activeChild: ReturnType<typeof spawn> | null = null;
+
 // Robust run using node:child_process, not Bun.spawn (avoids segfault on large DB)
 async function runWithLog(
   cmd: string[],
@@ -91,6 +94,23 @@ async function runWithLog(
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    activeChild = child;
+    const cleanup = () => {
+      activeChild = null;
+      process.removeListener("SIGINT", sigKill);
+      process.removeListener("SIGTERM", sigKill);
+    };
+    const sigKill = () => {
+      try { child.kill("SIGTERM"); } catch {}
+      // also kill pg_* siblings for -j parallel (pg_restore forks 10 workers)
+      try {
+        const { spawnSync } = require("node:child_process");
+        spawnSync("pkill", ["-TERM", "-f", "pg_restore"], { stdio: "ignore" });
+        spawnSync("pkill", ["-TERM", "-f", "pg_dump"], { stdio: "ignore" });
+      } catch {}
+    };
+    process.once("SIGINT", sigKill);
+    process.once("SIGTERM", sigKill);
 
     const handle = (data: Buffer) => {
       const text = data.toString();
@@ -109,6 +129,7 @@ async function runWithLog(
     child.stderr?.on("data", handle);
 
     child.on("error", (err) => {
+      cleanup();
       try {
         appendFileSync(logFile, `[spawn error] ${err.message}\n`);
       } catch {}
@@ -117,6 +138,7 @@ async function runWithLog(
     });
 
     child.on("close", (code) => {
+      cleanup();
       resolve(code ?? 0);
     });
   });

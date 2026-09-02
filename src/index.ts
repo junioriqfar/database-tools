@@ -29,10 +29,24 @@ function logError(msg: string) {
   console.log(chalk.red("✖"), msg);
 }
 
-// Handle Ctrl+C / EPIPE gracefully
+// Handle Ctrl+C / EPIPE gracefully — also kill orphan pg_dump/pg_restore (parity backup/restore)
 process.on("SIGINT", () => {
-  console.log(chalk.yellow("\nCancelled."));
-  process.exit(0);
+  console.log(chalk.yellow("\nCancelled — stopping pg_dump/pg_restore..."));
+  try {
+    const { spawnSync } = require("node:child_process");
+    spawnSync("pkill", ["-TERM", "-f", "pg_restore"], { stdio: "ignore" });
+    spawnSync("pkill", ["-TERM", "-f", "pg_dump"], { stdio: "ignore" });
+    spawnSync("pkill", ["-TERM", "-f", "psql"], { stdio: "ignore" });
+  } catch {}
+  setTimeout(() => process.exit(130), 300);
+});
+process.on("SIGTERM", () => {
+  try {
+    const { spawnSync } = require("node:child_process");
+    spawnSync("pkill", ["-TERM", "-f", "pg_restore"], { stdio: "ignore" });
+    spawnSync("pkill", ["-TERM", "-f", "pg_dump"], { stdio: "ignore" });
+  } catch {}
+  setTimeout(() => process.exit(143), 300);
 });
 
 async function main() {
