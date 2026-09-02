@@ -1,4 +1,7 @@
+data/
 dist/
+database-tools
+database-tools-*
 node_modules
 backups/*
 !backups/.gitkeep
