@@ -373,7 +373,7 @@ export async function backupDatabase(opts: BackupOptions): Promise<{ files: stri
         if (existsSync(outPath)) {
           outPath = uniqueDir(outPath);
         }
-        args.push("-F", "d", "-j", String(jobs), "--no-owner", "-f", outPath);
+        args.push("-F", "d", "-j", String(jobs), "--no-owner", "--no-privileges", "-f", outPath);
         onProgress?.(`[DIR] Dumping to ${basename(outPath)}/ with ${jobs} jobs (fastest for large DB)...`);
         break;
       default:
@@ -529,7 +529,7 @@ export async function restoreDatabase(opts: RestoreOptions): Promise<void> {
     if (exit !== 0) throw new Error(`psql restore failed with ${exit}`);
   } else if (isDirectory || isTar || isCustom) {
     const pgRestore = getPgRestorePath(pgBin);
-    const base = [pgRestore, "-h", target.host, "-p", String(target.port), "-U", target.username, "-d", target.database, "-v", "--clean", "--if-exists"];
+    const base = [pgRestore, "-h", target.host, "-p", String(target.port), "-U", target.username, "-d", target.database, "-v", "--clean", "--if-exists", "--no-owner", "--no-acl"];
     let cmd: string[];
     if (isDirectory) {
       // Directory + Custom support parallel jobs with hyper-threading
