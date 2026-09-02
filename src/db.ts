@@ -307,6 +307,66 @@ export async function getRestoreObjectCount(pgBin: string, dumpFile: string): Pr
   });
 }
 
+export async function getRestoreOwners(pgBin: string, dumpFile: string): Promise<string[]> {
+  const pgRestore = getPgRestorePath(pgBin);
+  if (dumpFile.endsWith(".sql")) return [];
+  return new Promise<string[]>((resolve) => {
+    const child = spawn(pgRestore, ["-l", dumpFile], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("close", (code) => {
+      if (code !== 0) resolve([]);
+      else {
+        const owners = new Set<string>();
+        for (const line of out.split("\n")) {
+          const t = line.trim();
+          if (!t || t.startsWith(";")) continue;
+          const parts = t.split(";");
+          const last = parts[parts.length - 1]?.trim();
+          if (!last) continue;
+          // owner is last token after space: e.g. "1259 549742 TABLE public t owner"
+          const tokens = last.split(/\s+/).filter(Boolean);
+          const owner = tokens[tokens.length - 1];
+          if (owner && owner !== "-" && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(owner)) owners.add(owner);
+        }
+        resolve([...owners]);
+      }
+    });
+    child.on("error", () => resolve([]));
+  });
+}
+
+export async function ensureRoles(pgBin: string, target: RestoreTarget, roles: string[], onProgress?: (msg: string) => void): Promise<void> {
+  if (roles.length === 0) return;
+  const psql = getPsqlPath(pgBin);
+  const env = { PGPASSWORD: target.password };
+  // get existing roles
+  const existing = await new Promise<Set<string>>((resolve) => {
+    const cmd = [psql, "-h", target.host, "-p", String(target.port), "-U", target.username, "-d", "postgres", "-t", "-A", "-c", "SELECT rolname FROM pg_roles;"];
+    const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let out = "";
+    child.stdout?.on("data", (d) => (out += d.toString()));
+    child.on("close", () => {
+      const set = new Set(out.split("\n").map((s) => s.trim()).filter(Boolean));
+      resolve(set);
+    });
+    child.on("error", () => resolve(new Set()));
+  });
+  for (const r of roles) {
+    if (existing.has(r)) continue;
+    // sanitize role name (alphanum + _)
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(r)) continue;
+    onProgress?.(`Creating missing role "${r}" (NOLOGIN) for restore...`);
+    await new Promise<void>((resolve) => {
+      const ident = escapeSqlIdentifier(r);
+      const cmd = [psql, "-h", target.host, "-p", String(target.port), "-U", target.username, "-d", "postgres", "-c", `CREATE ROLE ${ident} NOLOGIN;`];
+      const child = spawn(cmd[0]!, cmd.slice(1), { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      child.on("close", () => resolve());
+      child.on("error", () => resolve());
+    });
+  }
+}
+
 export async function getTables(pgBin: string, db: DatabaseConfig, schema: string): Promise<string[]> {
   const psql = getPsqlPath(pgBin);
   const env = { PGPASSWORD: db.password };
@@ -533,6 +593,15 @@ export async function restoreDatabase(opts: RestoreOptions): Promise<void> {
   const isSql = dumpFile.endsWith(".sql");
   const isTar = dumpFile.endsWith(".tar");
   const isCustom = dumpFile.endsWith(".dump") || dumpFile.endsWith(".custom");
+
+  // Auto-create missing roles for old dumps (owner/DEFAULT ACL) — even with --no-owner --no-acl, ALTER OWNER/DEFAULT PRIV still needs role
+  try {
+    const owners = await getRestoreOwners(pgBin, dumpFile);
+    if (owners.length > 0) {
+      onProgress?.(`Found ${owners.length} distinct owners in dump: ${owners.slice(0, 8).join(", ")}${owners.length > 8 ? " ..." : ""}`);
+      await ensureRoles(pgBin, target, owners, onProgress);
+    }
+  } catch {}
 
   if (target.createIfNotExists) {
     onProgress?.(`Checking if database ${target.database} exists...`);
